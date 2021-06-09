@@ -11,55 +11,60 @@
 #include "parse.h"
 #include "pcsa_net.h"
 
+#define MAX_HEADER_BUF 8192
 #define MAXBUF 4096
 
-int port; 
+char port[MAXBUF]; 
 char rootDir[MAXBUF];
 typedef struct sockaddr SA;
 
 void get_cli_argument(int argc, char **argv) {
+    printf("PARSING!\n");
     int ch;
     static struct option long_options[] = {
         {"port", required_argument, NULL, 'p'},
         {"root", required_argument, NULL, 'r'},
         {NULL, 0, NULL, 0}
     };
-
+    printf("running loop\n");
     // loop over all of the options
     while ((ch = getopt_long(argc, argv, "p:r:", long_options, NULL)) != -1) {
         // check to see if a single character or long option came through
         switch (ch) {
             // short option 't'
             case 'p':
-                port = atoi(optarg);
+                printf("port: %s\n", optarg);
+                strcpy(port, optarg);
                 break;
             // short option 'a'
             case 'r':
+                printf("rootdir: %s\n", optarg);
                 strcpy(rootDir, optarg);
                 break;
         }
     }
 }
 
-const char* get_MIME(char * filename) {
-    char* tmp = NULL;
+char* get_MIME(char * filename) {
     const char *file_ext = strrchr(filename, '.');
-    if(!file_ext || file_ext == filename) return tmp;
-
+    if(!file_ext || file_ext == filename) return NULL;
+    char* tmp = malloc(sizeof(char) * MAXBUF);
     if(!strcmp(file_ext, ".html"))
-        tmp = "text/html";
+        strcpy(tmp, "text/html");
     else if (!strcmp(file_ext, ".css"))
-        tmp = "text/css";
+        strcpy(tmp, "text/css");
     else if (!strcmp(file_ext, ".js"))
-        tmp = "text/javascript";
+        strcpy(tmp, "text/javascript");
     else if (!strcmp(file_ext, ".png"))
-        tmp = "image/png";
+        strcpy(tmp,"image/png");
     else if (!strcmp(file_ext, ".jpg") || !strcmp(file_ext, ".jpeg"))
-        tmp = "image/jpg";
+        strcpy(tmp,"image/jpg");
     else if (!strcmp(file_ext, ".gif"))
-        tmp = "image/gif";
+        strcpy(tmp,"image/gif");
     else if (!strcmp(file_ext, ".txt"))
-        tmp = "text/plain";
+        strcpy(tmp,"text/plain");
+    else
+        return NULL;
     return tmp;
 }
 
@@ -90,11 +95,38 @@ void response_404(int connFd) {
     response_template(buf, 404);
     sprintf(buf + strlen(buf),   
             "Content-Length: %lu\r\n"
-            "Content-Type: %s\r\n"
-            "Last-Modified: %s\r\n\r\n", strlen(msg));
+            "Content-Type: text/html\r\n", strlen(msg));
     write_all(connFd, buf, strlen(buf));
     write_all(connFd, msg, strlen(msg));
     free(msg);
+}
+
+void response_file(int inputFd, int connFd, int writeBody, char* mime_type) {
+    char buf[MAXBUF];
+    struct stat statBuffer;
+    struct timespec last_modified;
+    fstat(inputFd, &statBuffer);
+    int fileSize = statBuffer.st_size;
+    last_modified = statBuffer.st_ctim;
+    printf("%s", ctime(&statBuffer.st_mtime));
+    response_template(buf, 200);
+    sprintf(buf + strlen(buf), 
+            "Content-Length: %d\r\n"
+            "Content-Type: %s\r\n\r\n", fileSize, mime_type);
+
+    write_all(connFd, buf, strlen(buf));
+    if(writeBody) {
+        ssize_t numRead;
+        char fileBuf[MAXBUF];
+        while ((numRead = read(inputFd, fileBuf, MAXBUF)) > 0) {
+            char *tmpBuf = fileBuf;
+            while(numRead > 0) {
+                ssize_t numWritten = write(connFd, tmpBuf, numRead);
+                numRead -= numWritten;
+                tmpBuf += numWritten;
+            }
+        }
+    }
 }
 
 void get_file(char* filename, int connFd, int writeBody) {
@@ -103,6 +135,7 @@ void get_file(char* filename, int connFd, int writeBody) {
 
     strcpy(fullDir, rootDir);
     strcat(fullDir, filename);
+    printf("Full dir path: %s\n", fullDir);
     int inputFd = open(fullDir, O_RDONLY);
     if(inputFd < 0 || (mime_type=get_MIME(filename)) != NULL) {
         printf("File not found!\n");
@@ -124,43 +157,38 @@ void response_400(int connFd) {
     write_all(connFd, responseBuf, strlen(responseBuf));
 }
 
-void response_file(int inputFd, int connFd, int writeBody, char* mime_type) {
-    char buf[MAXBUF];
-    struct stat statBuffer;
-    struct timespec last_modified;
-    fstat(inputFd, &statBuffer);
-    int fileSize = statBuffer.st_size;
-    last_modified = statBuffer.st_ctim;
-    printf("%s", ctime(&statBuffer.st_mtime));
-    response_template(buf, 200);
-    sprintf(buf + strlen(buf), 
-            "Content-length: %lu\r\n"
-            "Content-type: %s\r\n\r\n", fileSize, mime_type);
-
-    write_all(connFd, buf, strlen(buf));
-    if(writeBody) {
-        ssize_t numRead;
-        char fileBuf[MAXBUF];
-        while ((numRead = read(inputFd, fileBuf, MAXBUF)) > 0) {
-            char *tmpBuf = fileBuf;
-            while(numRead > 0) {
-                ssize_t numWritten = write(connFd, tmpBuf, numRead);
-                numRead -= numWritten;
-                tmpBuf += numWritten;
-            }
+ssize_t get_request_buffer(int connFd, char* buf) {
+    int totalRead = 0;
+    int numRead;
+    char *bufp = buf;
+    printf("BUFFERING REQUEST....\n");
+    while(totalRead <= MAX_HEADER_BUF) {
+        printf("TOTAL READ.....%d\n", totalRead);
+        if((numRead = read(connFd, bufp, 256)) > 0) {
+            totalRead += numRead;
+            if(totalRead > MAX_HEADER_BUF) return -1;
+            bufp += numRead;
         }
+        else if(numRead == 0) 
+            break;
+        else 
+            return -1;
     }
+    return totalRead;
 }
 
+
 void read_request(int connFd) {
-    char buf[8192];
-    int readRet = read(connFd, buf, 8192);
-    // Parse the buffer to the parse function. 
-    // You will need to pass the socket fd and the buffer would need to
-    // be read from that fd
-    Request *request = parse(buf, readRet, connFd);
+    printf("Reading request\n");
+    char buf[MAX_HEADER_BUF+555];
+    ssize_t request_buf_len = get_request_buffer(connFd, buf);
+    printf("Get buffer complete..\n");
+    printf("buffer read is %ld\n", request_buf_len);
+    Request *request;
+    if(request_buf_len > 0)
+        request = parse(buf, request_buf_len, connFd);
     //Just printing everything
-    if(request != NULL) { 
+    if(request != NULL || request_buf_len > 0) { 
         char* http_method = request->http_method;
         char* http_uri = request->http_uri;
  
@@ -180,12 +208,14 @@ void read_request(int connFd) {
         free(request->headers);
         free(request);
     } else {
+        printf("Bad request...\n");
         response_400(connFd);
     }
 }
 
 int start_server() {
     int listenFd = open_listenfd(port);
+    printf("STARTING SERVER!!!\n");
     for (;;) {
         struct sockaddr_storage clientAddr;
         socklen_t clientLen = sizeof(struct sockaddr_storage);
@@ -208,6 +238,7 @@ int start_server() {
 int main(int argc, char **argv){
     //Read from the file the sample
     // https://stackoverflow.com/questions/7489093/getopt-long-proper-way-to-use-it
+    printf("YEP THIS THING RUN IN MAIN!\n");
     get_cli_argument(argc, argv);
     start_server();
 }
