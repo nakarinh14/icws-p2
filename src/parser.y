@@ -219,10 +219,8 @@ request_header: token ows t_colon ows text ows t_crlf {
  * 2616.  All the best!
  *
  */
-request_headers
-    : request_header
-    | request_headers request_header
-    ;
+request_headers: request_headers request_header {}
+          | {};    /* Request headers can be empty */
 
 request: request_line request_headers t_crlf{
 	YPRINTF("parsing_request: Matched Success.\n");

@@ -19,6 +19,33 @@ char port[MAXBUF];
 char rootDir[MAXBUF];
 typedef struct sockaddr SA;
 
+
+static const char *DAY_NAMES[] =
+  { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+static const char *MONTH_NAMES[] =
+  { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+// https://stackoverflow.com/questions/2726975/how-can-i-generate-an-rfc1123-date-string-from-c-code-win32
+char * parse_rfc_datetime(time_t * t) {
+    const int RFC1123_TIME_LEN = 29;
+    char * buf = malloc(RFC1123_TIME_LEN+1);
+    struct tm tm;
+
+    gmtime_r(t, &tm);
+    strftime(buf, RFC1123_TIME_LEN+1, "---, %d --- %Y %H:%M:%S GMT", &tm);
+    memcpy(buf, DAY_NAMES[tm.tm_wday], 3);
+    memcpy(buf+8, MONTH_NAMES[tm.tm_mon], 3);
+
+    return buf;
+}
+
+char * get_current_time(){
+    time_t t;
+    time(&t);
+    return parse_rfc_datetime(&t);
+}
+
 void get_cli_argument(int argc, char **argv) {
     int ch;
     static struct option long_options[] = {
@@ -79,12 +106,22 @@ void response_template(char* buf, int status) {
         default:
             strcpy(status_message, "Bad Request");
     }
+    char* currDate = get_current_time();
     sprintf(buf,
             "HTTP/1.1 %d %s\r\n"
             "Server: ICWS\r\n"
-            "Connection: close\r\n",
+            "Connection: close\r\n"
+            "Date: %s\r\n",
             status,
-            status_message);
+            status_message,
+            currDate);
+    free(currDate);
+}
+
+void response_error_template(int connFd, int status) {
+    char responseBuf[MAXBUF];
+    response_template(responseBuf, status);
+    write_all(connFd, responseBuf, strlen(responseBuf));
 }
 
 void response_404(int connFd) {
@@ -94,10 +131,9 @@ void response_404(int connFd) {
     response_template(buf, 404);
     sprintf(buf + strlen(buf),   
             "Content-Length: %lu\r\n"
-            "Content-Type: text/html\r\n", strlen(msg));
+            "Content-Type: text/html\r\n\r\n", strlen(msg));
     write_all(connFd, buf, strlen(buf));
     write_all(connFd, msg, strlen(msg));
-    free(msg);
 }
 
 void response_file(int inputFd, int connFd, int writeBody, char* mime_type) {
@@ -105,11 +141,13 @@ void response_file(int inputFd, int connFd, int writeBody, char* mime_type) {
     struct stat statBuffer;
     fstat(inputFd, &statBuffer);
     int fileSize = statBuffer.st_size;
+    char * modified_time = parse_rfc_datetime(&statBuffer.st_mtime);
     response_template(buf, 200);
     sprintf(buf + strlen(buf), 
             "Content-Length: %d\r\n"
             "Content-Type: %s\r\n"
-            "Last-Modified: %s\r\n\r\n", fileSize, mime_type, ctime(&statBuffer.st_mtime));
+            "Last-Modified: %s\r\n\r\n", 
+            fileSize, mime_type, modified_time);
 
     write_all(connFd, buf, strlen(buf));
     if(writeBody) {
@@ -124,6 +162,7 @@ void response_file(int inputFd, int connFd, int writeBody, char* mime_type) {
             }
         }
     }
+    free(modified_time);
 }
 
 void get_file(char* filename, int connFd, int writeBody) {
@@ -141,20 +180,6 @@ void get_file(char* filename, int connFd, int writeBody) {
         response_file(inputFd, connFd, writeBody, mime_type);
         free(mime_type);
     }
-}
-
-void response_not_implemented(int connFd) {
-    printf("Returning 501...\n");
-    char responseBuf[MAXBUF];
-    response_template(responseBuf, 501);
-    write_all(connFd, responseBuf, strlen(responseBuf));
-}
-
-void response_400(int connFd) {
-    printf("Returning 400...\n");
-    char responseBuf[MAXBUF];
-    response_template(responseBuf, 400);
-    write_all(connFd, responseBuf, strlen(responseBuf));
 }
 
 ssize_t get_request_buffer(int connFd, char* buf) {
@@ -212,7 +237,7 @@ void read_request(int connFd) {
             get_file(http_uri, connFd, 0);
         }
         else {
-            response_not_implemented(connFd);
+            response_error_template(connFd, 501);
         }
         for(int index = 0;index < request->header_count; index++){
             printf("Request Header\n");
@@ -222,7 +247,7 @@ void read_request(int connFd) {
         free(request);
     } else {
         printf("Bad request...\n");
-        response_400(connFd);
+        response_error_template(connFd, 400);
     }
 }
 
