@@ -178,6 +178,7 @@ void get_file(char* filename, int connFd, int writeBody) {
         response_404(connFd);
     } else {
         response_file(inputFd, connFd, writeBody, mime_type);
+        close(inputFd);
         free(mime_type);
     }
 }
@@ -190,6 +191,8 @@ ssize_t get_request_buffer(int connFd, char* buf) {
     char *bufp = buf;
     printf("BUFFERING REQUEST....\n");
     while(totalRead <= MAX_HEADER_BUF) {
+        // TODO:
+        // Add nonblock read, and detect time elapsed for timeout request
         if((numRead = read(connFd, bufp, 1)) > 0) {
             totalRead += numRead;
             if(totalRead > MAX_HEADER_BUF) return -1;
