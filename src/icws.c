@@ -1,9 +1,10 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include<sys/socket.h>
-#include<netdb.h>
+#include <sys/socket.h>
+#include <netdb.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <getopt.h>
@@ -19,24 +20,18 @@ char rootDir[MAXBUF];
 typedef struct sockaddr SA;
 
 void get_cli_argument(int argc, char **argv) {
-    printf("PARSING!\n");
     int ch;
     static struct option long_options[] = {
         {"port", required_argument, NULL, 'p'},
         {"root", required_argument, NULL, 'r'},
         {NULL, 0, NULL, 0}
     };
-    printf("running loop\n");
-    // loop over all of the options
     while ((ch = getopt_long(argc, argv, "p:r:", long_options, NULL)) != -1) {
-        // check to see if a single character or long option came through
         switch (ch) {
-            // short option 't'
             case 'p':
                 printf("port: %s\n", optarg);
                 strcpy(port, optarg);
                 break;
-            // short option 'a'
             case 'r':
                 printf("rootdir: %s\n", optarg);
                 strcpy(rootDir, optarg);
@@ -49,6 +44,7 @@ char* get_MIME(char * filename) {
     const char *file_ext = strrchr(filename, '.');
     if(!file_ext || file_ext == filename) return NULL;
     char* tmp = malloc(sizeof(char) * MAXBUF);
+    printf("file ext is: %s\n", file_ext);
     if(!strcmp(file_ext, ".html"))
         strcpy(tmp, "text/html");
     else if (!strcmp(file_ext, ".css"))
@@ -80,6 +76,8 @@ void response_template(char* buf, int status) {
         case 501:
             strcpy(status_message, "Not Implemented");
             break;
+        default:
+            strcpy(status_message, "Bad Request");
     }
     sprintf(buf,
             "HTTP/1.1 %d %s\r\n"
@@ -90,6 +88,7 @@ void response_template(char* buf, int status) {
 }
 
 void response_404(int connFd) {
+    printf("Returning 404...\n");
     char buf[MAXBUF];
     char *msg = "<h1>404 Content not found</h1> ";
     response_template(buf, 404);
@@ -104,15 +103,13 @@ void response_404(int connFd) {
 void response_file(int inputFd, int connFd, int writeBody, char* mime_type) {
     char buf[MAXBUF];
     struct stat statBuffer;
-    struct timespec last_modified;
     fstat(inputFd, &statBuffer);
     int fileSize = statBuffer.st_size;
-    last_modified = statBuffer.st_ctim;
-    printf("%s", ctime(&statBuffer.st_mtime));
     response_template(buf, 200);
     sprintf(buf + strlen(buf), 
             "Content-Length: %d\r\n"
-            "Content-Type: %s\r\n\r\n", fileSize, mime_type);
+            "Content-Type: %s\r\n"
+            "Last-Modified: %s\r\n\r\n", fileSize, mime_type, ctime(&statBuffer.st_mtime));
 
     write_all(connFd, buf, strlen(buf));
     if(writeBody) {
@@ -137,21 +134,24 @@ void get_file(char* filename, int connFd, int writeBody) {
     strcat(fullDir, filename);
     printf("Full dir path: %s\n", fullDir);
     int inputFd = open(fullDir, O_RDONLY);
-    if(inputFd < 0 || (mime_type=get_MIME(filename)) != NULL) {
+    if(inputFd < 0 || (mime_type=get_MIME(filename)) == NULL) {
         printf("File not found!\n");
         response_404(connFd);
     } else {
         response_file(inputFd, connFd, writeBody, mime_type);
+        free(mime_type);
     }
 }
 
 void response_not_implemented(int connFd) {
+    printf("Returning 501...\n");
     char responseBuf[MAXBUF];
     response_template(responseBuf, 501);
     write_all(connFd, responseBuf, strlen(responseBuf));
 }
 
 void response_400(int connFd) {
+    printf("Returning 400...\n");
     char responseBuf[MAXBUF];
     response_template(responseBuf, 400);
     write_all(connFd, responseBuf, strlen(responseBuf));
@@ -160,20 +160,33 @@ void response_400(int connFd) {
 ssize_t get_request_buffer(int connFd, char* buf) {
     int totalRead = 0;
     int numRead;
+    char eof_limiter[] = {'\r','\n'};
+    int eof_pointer = 0;
     char *bufp = buf;
     printf("BUFFERING REQUEST....\n");
     while(totalRead <= MAX_HEADER_BUF) {
-        printf("TOTAL READ.....%d\n", totalRead);
-        if((numRead = read(connFd, bufp, 256)) > 0) {
+        if((numRead = read(connFd, bufp, 1)) > 0) {
             totalRead += numRead;
             if(totalRead > MAX_HEADER_BUF) return -1;
             bufp += numRead;
+            // When \r\n\r\n is send, terminate the sock stream;
+            if(eof_limiter[eof_pointer % 2] == buf[totalRead-1]) {
+                if(++eof_pointer == 4)
+                    break;
+            }
+            else
+                eof_pointer = 0;
         }
-        else if(numRead == 0) 
+        else if(numRead == 0) {
+            printf("Client terminate connection...\n");
             break;
-        else 
+        }
+        else {
+            printf("Ops error..\n");
             return -1;
+        }
     }
+    bufp = '\0';
     return totalRead;
 }
 
@@ -181,6 +194,7 @@ ssize_t get_request_buffer(int connFd, char* buf) {
 void read_request(int connFd) {
     printf("Reading request\n");
     char buf[MAX_HEADER_BUF+555];
+    // echo_logic(connFd);
     ssize_t request_buf_len = get_request_buffer(connFd, buf);
     printf("Get buffer complete..\n");
     printf("buffer read is %ld\n", request_buf_len);
@@ -191,7 +205,6 @@ void read_request(int connFd) {
     if(request != NULL || request_buf_len > 0) { 
         char* http_method = request->http_method;
         char* http_uri = request->http_uri;
- 
         if(!strcmp(http_method, "GET")) {
             get_file(http_uri, connFd, 1);
         }
@@ -231,6 +244,7 @@ int start_server() {
             printf("Connection from ?UNKNOWN?\n");
                 
         read_request(connFd);
+        printf("closing request..\n");
         close(connFd);
     }
 }
@@ -238,7 +252,6 @@ int start_server() {
 int main(int argc, char **argv){
     //Read from the file the sample
     // https://stackoverflow.com/questions/7489093/getopt-long-proper-way-to-use-it
-    printf("YEP THIS THING RUN IN MAIN!\n");
     get_cli_argument(argc, argv);
     start_server();
 }
