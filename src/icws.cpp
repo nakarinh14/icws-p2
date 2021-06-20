@@ -210,29 +210,28 @@ void get_file(char* filename, int connFd, int writeBody) {
     if (inputFd < 0 || (mime_type = get_MIME(filename)).empty())
     {
         response_404(connFd);
+        printf("response 404\n..");
+        fflush(stdout);
     }
     else
     {
         response_file(inputFd, connFd, writeBody, mime_type);
-        close(inputFd);
     }
+    if(inputFd) close(inputFd);
+    printf("closing file\n..");
+    fflush(stdout);
 }
 
-ssize_t get_request_buffer(int connFd, char* buf) {
+ssize_t get_request_buffer(pollfd fds[], char* buf) {
     int numRead, rc, isCLRF, clrfPointer;
-    int totalRead = 0, nfds = 1;
+    int connFd = fds[0].fd;
+    int totalRead = 0;
     char eof_limiter[] = {'\r', '\n'};
     char *bufp = buf;
-    
-    struct pollfd fds[1];
-    memset(fds, 0, sizeof(fds));
-    fds[0].fd = connFd;
-    fds[0].events = POLLIN;
 
     while(totalRead <= MAX_HEADER_BUF) {
-        rc = poll(fds, nfds, timeout * 1000);
-        if (rc <= 0)
-            return -1;
+        rc = poll(fds, 1, timeout * 1000);
+        if (rc <= 0) break;
         if ((numRead = read(connFd, bufp, READ_REQUEST_BUF)) > 0)
         {
             totalRead += numRead;
@@ -262,7 +261,7 @@ ssize_t get_request_buffer(int connFd, char* buf) {
 
 void* thread_read_request(void *args) {
     for (;;) {
-        int connFd;
+        int connFd, rc;
         // Wait for pthread_cond signal
         pthread_mutex_lock(&shared.work_q.jobs_mutex);
         while (shared.work_q.is_empty()) {
@@ -271,38 +270,69 @@ void* thread_read_request(void *args) {
         shared.work_q.remove_job(&connFd);
         pthread_mutex_unlock(&shared.work_q.jobs_mutex);
 
-        char buf[MAX_HEADER_BUF + 555];
-        ssize_t request_buf_len = get_request_buffer(connFd, buf);
-        Request *request = NULL;
-        if (request_buf_len > 0)
-        {
-            pthread_mutex_lock(&parse_mutex);
-            request = parse(buf, request_buf_len, connFd);
-            pthread_mutex_unlock(&parse_mutex);
-        }
-        if (request != NULL && request_buf_len > 0)
-        {
-            char* http_method = request->http_method;
-            char* http_uri = request->http_uri;
-            // Remove leading slash for filesystem path join to work properly
-            while(strlen(http_uri) && http_uri[0] == '/')
-                http_uri++;
-            
-            if(!strcmp(http_method, "GET")) 
-                get_file(http_uri, connFd, 1);
-            else if(!strcmp(http_method, "HEAD")) 
-                get_file(http_uri, connFd, 0);
-            else 
-                response_error_template(connFd, 501);
-            free(request->headers);
-            free(request);
-        }
-        else
-            response_error_template(connFd, 400);
+        // Initialize polling for connFd
+        struct pollfd fds[1];
+        memset(fds, 0, sizeof(fds));
+        fds[0].fd = connFd;
+        fds[0].events = POLLIN;
 
+        // TODO: Add support for HTTP Pipeline
+
+        while(true) {
+            rc = poll(fds, 1, timeout * 1000);
+            printf("rc: %d\n", rc);
+            fflush(stdout);
+            if (rc <= 0) {
+                break;
+            }
+            char buf[MAX_HEADER_BUF + 555];
+            ssize_t request_buf_len = get_request_buffer(fds, buf);
+            if (request_buf_len < 0) {
+                // poll will return > 1 under browser request, but no data is given.
+                // stop immediately.
+                break;
+            }
+            Request *request = NULL;
+            if (request_buf_len > 0)
+            {
+                pthread_mutex_lock(&parse_mutex);
+                request = parse(buf, request_buf_len, connFd);
+                printf("parsed\n..");
+                fflush(stdout);
+                pthread_mutex_unlock(&parse_mutex);
+            }
+            printf("%ld\n", request_buf_len);
+            fflush(stdout);
+            if (request != NULL && request_buf_len > 0) {
+                char* http_method = request->http_method;
+                char* http_uri = request->http_uri;
+                // Remove leading slash for filesystem path join to work properly
+                while(strlen(http_uri) && http_uri[0] == '/')
+                    http_uri++;
+                
+                if(!strcmp(http_method, "GET")) 
+                    get_file(http_uri, connFd, 1);
+                else if(!strcmp(http_method, "HEAD")) 
+                    get_file(http_uri, connFd, 0);
+                else 
+                    response_error_template(connFd, 501);
+                printf("freeing request\n..");
+                fflush(stdout);
+                free(request->headers);
+                free(request);
+                printf("request freed\n..");
+                fflush(stdout);
+            }
+            else {
+                response_error_template(connFd, 400);
+            }
+            printf("eol\n..");
+            fflush(stdout);
+        }
+        printf("closing connection\n..");
+        fflush(stdout);
         close(connFd);
     }
-    
 }
 
 void initialize_thread_pools() {
