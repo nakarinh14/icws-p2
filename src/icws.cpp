@@ -144,10 +144,12 @@ void response_template(char* buf, int status) {
     sprintf(buf,
             "HTTP/1.1 %d %s\r\n"
             "Server: ICWS\r\n"
-            "Connection: close\r\n"
+            "Connection: keep-alive\r\n"
+            "Keep-Alive: timeout=%d, max=0\r\n"
             "Date: %s\r\n",
             status,
             status_message,
+            timeout,
             currDate);
     free(currDate);
 }
@@ -210,16 +212,12 @@ void get_file(char* filename, int connFd, int writeBody) {
     if (inputFd < 0 || (mime_type = get_MIME(filename)).empty())
     {
         response_404(connFd);
-        printf("response 404\n..");
-        fflush(stdout);
     }
     else
     {
         response_file(inputFd, connFd, writeBody, mime_type);
     }
     if(inputFd) close(inputFd);
-    printf("closing file\n..");
-    fflush(stdout);
 }
 
 ssize_t get_request_buffer(pollfd fds[], char* buf) {
@@ -280,29 +278,24 @@ void* thread_read_request(void *args) {
 
         while(true) {
             rc = poll(fds, 1, timeout * 1000);
-            printf("rc: %d\n", rc);
-            fflush(stdout);
+            // printf("rc: %d\n", rc);
+            // fflush(stdout);
             if (rc <= 0) {
                 break;
             }
             char buf[MAX_HEADER_BUF + 555];
             ssize_t request_buf_len = get_request_buffer(fds, buf);
-            if (request_buf_len < 0) {
-                // poll will return > 1 under browser request, but no data is given.
-                // stop immediately.
-                break;
-            }
             Request *request = NULL;
             if (request_buf_len > 0)
             {
                 pthread_mutex_lock(&parse_mutex);
                 request = parse(buf, request_buf_len, connFd);
-                printf("parsed\n..");
-                fflush(stdout);
+                // printf("parsed\n..");
+                // fflush(stdout);
                 pthread_mutex_unlock(&parse_mutex);
             }
-            printf("%ld\n", request_buf_len);
-            fflush(stdout);
+            // printf("%ld\n", request_buf_len);
+            // fflush(stdout);
             if (request != NULL && request_buf_len > 0) {
                 char* http_method = request->http_method;
                 char* http_uri = request->http_uri;
@@ -316,21 +309,14 @@ void* thread_read_request(void *args) {
                     get_file(http_uri, connFd, 0);
                 else 
                     response_error_template(connFd, 501);
-                printf("freeing request\n..");
-                fflush(stdout);
+                    
                 free(request->headers);
                 free(request);
-                printf("request freed\n..");
-                fflush(stdout);
             }
             else {
                 response_error_template(connFd, 400);
             }
-            printf("eol\n..");
-            fflush(stdout);
         }
-        printf("closing connection\n..");
-        fflush(stdout);
         close(connFd);
     }
 }
@@ -354,10 +340,9 @@ int start_server() {
         char hostBuf[MAXBUF], svcBuf[MAXBUF];
         if (getnameinfo((SA *) &clientAddr, clientLen, 
                         hostBuf, MAXBUF, svcBuf, MAXBUF, 0)==0)
-            ;
-        // printf("Connection from %s:%s\n", hostBuf, svcBuf);
-        // else
-        //     printf("Connection from ?UNKNOWN?\n");
+            printf("Connection from %s:%s\n", hostBuf, svcBuf);
+        else
+            printf("Connection from ?UNKNOWN?\n");
         
         shared.work_q.add_job(connFd, &queue_cond);
     }
