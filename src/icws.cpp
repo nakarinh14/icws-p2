@@ -142,11 +142,20 @@ void response_template(char* buf, int status) {
         case 404:
             strcpy(status_message, "Not Found");
             break;
+        case 408:
+            strcpy(status_message, "Request Timeout");
+            break;
+        case 411:
+            strcpy(status_message, "Length Required");
+            break;
         case 500:
             strcpy(status_message, "Internal Server Error");
             break;
         case 501:
             strcpy(status_message, "Not Implemented");
+            break;
+        case 505:
+            strcpy(status_message, "HTTP Version Not Supported");
             break;
         default:
             strcpy(status_message, "Bad Request");
@@ -230,36 +239,48 @@ void get_file(char* filename, int connFd, int writeBody) {
     if(inputFd) close(inputFd);
 }
 /* Finding the true request headers length, excluding any extra partial request or body */
-int get_request_diff_crlf_length(char * buf) {
-    char *searched = strstr(buf, "\r\n\r\n");
+int get_request_diff_crlf_length(char * bufp, int full_buf_length) {
+    if(full_buf_length < 4) return -1;
+    char *searched = strstr(bufp, "\r\n\r\n");
     if(searched == NULL) {
         return -1;
     }
-    return strlen(buf) - strlen(searched+4);
+    return full_buf_length - strlen(searched+4);
 }
-/* Handle reading request from connFd to store in buffer */
-ssize_t get_request_buffer(pollfd fds[], char* buf, int offset, int remain_content_length) {
-    printf("Getting buffer\n");
+/*
+    Handle reading request from connFd to store in buffer. Return true length until crlf of first request 
+    Return value: 
+        -1 System error
+        -2 Timeout error
+        Positive int refers buf true size 
+*/
+int get_request_buffer(pollfd fds[], char* buf, int offset, int remain_content_length) {
     fflush(stdout);
+    // Quick check if buf have partial request, and already contain a complete request.
+    if(offset > 0) {
+        int crlf_check_length = get_request_diff_crlf_length(buf, strlen(buf));
+        if (crlf_check_length >= 0) return crlf_check_length;
+    }
+
     int numRead, rc, requestDiffLength;
     int connFd = fds[0].fd;
     int totalRead = offset;
     int maxLength = MAX_HEADER_BUF;
-    if(remain_content_length > 0) {
+    if(remain_content_length >= 0) {
         maxLength = remain_content_length;
     }
     char *bufp = buf + offset;
 
     while(totalRead < maxLength) {
         rc = poll(fds, 1, timeout * 1000);
-        if (rc <= 0) break;
-        if ((numRead = read(connFd, bufp, READ_REQUEST_BUF)) > 0) {
+        if (rc <= 0) return -2;
+        else if ((numRead = read(connFd, bufp, READ_REQUEST_BUF)) > 0) {
             totalRead += numRead;
             if(totalRead > maxLength) return -1;
             bufp += numRead;
-            if (strlen(buf) >= 4) {
-                requestDiffLength = get_request_diff_crlf_length(buf);
-                if (requestDiffLength >= 0) {
+            if(remain_content_length < 0 && totalRead >= 4){
+                requestDiffLength = get_request_diff_crlf_length(bufp-numRead-3, strlen(buf));
+                if (requestDiffLength > 0) {
                     totalRead = requestDiffLength;
                     break;
                 }
@@ -286,11 +307,11 @@ int get_content_length(Request * request) {
 /* Check if uri string is for cgi path */
 int uri_is_cgi(char * uri) { 
     char cgiString[] = "/cgi/";
-    int n = strlen(cgiString);
+    size_t n = strlen(cgiString);
     if (strlen(uri) < n)
         return 0;
 
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < (int) n; i++) {
         if(uri[i] != cgiString[i]) return 0;
     }
     printf("URL IS CGI!!\n");
@@ -301,7 +322,7 @@ int uri_is_cgi(char * uri) {
 int buffer_partial_to_front(char *buf, int request_buf_len) {
     /* Shift partial request content to front for persistent pipelining */
     int partial_length = strlen(buf) - request_buf_len;
-    if(partial_length > 0){
+    if(partial_length >= 0){
         memmove(buf, buf + request_buf_len, partial_length);
         memset(buf + partial_length, '\0', strlen(buf) - partial_length); // Set leftover to null terminating character
     }
@@ -326,14 +347,20 @@ void* thread_read_request(void *args) {
         fds[0].fd = connFd;
         fds[0].events = POLLIN;
 
-        while((rc=poll(fds, 1, timeout * 1000)) > 0) {
-            ssize_t request_buf_len = get_request_buffer(fds, buf, request_partial_length, -1);
+        while(request_partial_length > 0 || (rc=poll(fds, 1, timeout * 1000)) > 0) {
+            int request_buf_len = get_request_buffer(fds, buf, request_partial_length, -1);
             Request *request = NULL;
             if (request_buf_len > 0){
                 pthread_mutex_lock(&parse_mutex);
                 request = parse(buf, request_buf_len, connFd);
                 pthread_mutex_unlock(&parse_mutex);
             }
+            else if(request_buf_len == -2) {
+                // Timeout, incomplete request read
+                response_error_template(connFd, 408);
+                break;
+            }
+            
             if(request == NULL || request_buf_len <= 0) {
                 response_error_template(connFd, 400);
                 break;
@@ -342,6 +369,11 @@ void* thread_read_request(void *args) {
             char *http_method = request->http_method;
             char *http_uri = request->http_uri;
             
+            if(strcmp(request->http_version, "HTTP/1.1") != 0) {
+                response_error_template(connFd, 505);
+                break;
+            }
+
             /* Handling CGI Request */
             if(uri_is_cgi(http_uri)) {
                 char *post_body = NULL;
@@ -349,12 +381,11 @@ void* thread_read_request(void *args) {
                     // Continue fetching unfishied request.
                     int content_length = get_content_length(request);
                     if (content_length < 0 || request_buf_len + content_length > MAX_HEADER_BUF){
-                        response_error_template(connFd, 500);
+                        response_error_template(connFd, 411);
                         break;
                     }
-                    int index_body_start = request_buf_len + 4;
-                    get_request_buffer(fds, buf, strlen(buf), content_length - strlen(buf+index_body_start));
-                    post_body = buf + index_body_start;
+                    get_request_buffer(fds, buf, strlen(buf), content_length - strlen(buf+request_buf_len));
+                    post_body = buf + request_buf_len;
                 }
                 struct environ_struct environ_vars = {
                     request,
