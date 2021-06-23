@@ -237,11 +237,11 @@ int get_request_diff_crlf_length(char * buf) {
     }
     return strlen(buf) - strlen(searched+4);
 }
-
+/* Handle reading request from connFd to store in buffer */
 ssize_t get_request_buffer(pollfd fds[], char* buf, int offset, int remain_content_length) {
     printf("Getting buffer\n");
     fflush(stdout);
-    int numRead, rc, isCLRF, requestDiffLength;
+    int numRead, rc, requestDiffLength;
     int connFd = fds[0].fd;
     int totalRead = offset;
     int maxLength = MAX_HEADER_BUF;
@@ -250,7 +250,7 @@ ssize_t get_request_buffer(pollfd fds[], char* buf, int offset, int remain_conte
     }
     char *bufp = buf + offset;
 
-    while(totalRead <= maxLength) {
+    while(totalRead < maxLength) {
         rc = poll(fds, 1, timeout * 1000);
         if (rc <= 0) break;
         if ((numRead = read(connFd, bufp, READ_REQUEST_BUF)) > 0) {
@@ -298,9 +298,20 @@ int uri_is_cgi(char * uri) {
     return 1;
 }
 
+int buffer_partial_to_front(char *buf, int request_buf_len) {
+    /* Shift partial request content to front for persistent pipelining */
+    int partial_length = strlen(buf) - request_buf_len;
+    if(partial_length > 0){
+        memmove(buf, buf + request_buf_len, partial_length);
+        memset(buf + partial_length, '\0', strlen(buf) - partial_length); // Set leftover to null terminating character
+    }
+    return partial_length;
+}
+
 void* thread_read_request(void *args) {
     for (;;) {
-        int connFd, rc, is_persistent_request = 1;
+        char buf[MAX_HEADER_BUF + 555];
+        int connFd, rc, request_partial_length = 0;
         // Wait for pthread_cond signal
         pthread_mutex_lock(&shared.work_q.jobs_mutex);
         while (shared.work_q.is_empty()) {
@@ -315,13 +326,9 @@ void* thread_read_request(void *args) {
         fds[0].fd = connFd;
         fds[0].events = POLLIN;
 
-        // TODO: Add support for HTTP Pipeline
-
-        while((rc=poll(fds, 1, timeout * 1000)) > 0 && is_persistent_request) {
-            char buf[MAX_HEADER_BUF + 555];
-            ssize_t request_buf_len = get_request_buffer(fds, buf, 0, -1);
+        while((rc=poll(fds, 1, timeout * 1000)) > 0) {
+            ssize_t request_buf_len = get_request_buffer(fds, buf, request_partial_length, -1);
             Request *request = NULL;
-
             if (request_buf_len > 0){
                 pthread_mutex_lock(&parse_mutex);
                 request = parse(buf, request_buf_len, connFd);
@@ -337,16 +344,15 @@ void* thread_read_request(void *args) {
             
             /* Handling CGI Request */
             if(uri_is_cgi(http_uri)) {
-                is_persistent_request = 0;
                 char *post_body = NULL;
                 if (!strcmp(http_method, "POST")){
                     // Continue fetching unfishied request.
                     int content_length = get_content_length(request);
                     if (content_length < 0 || request_buf_len + content_length > MAX_HEADER_BUF){
-                        response_error_template(connFd, 400);
+                        response_error_template(connFd, 500);
                         break;
                     }
-                    int index_body_start = request_buf_len + 2;
+                    int index_body_start = request_buf_len + 4;
                     get_request_buffer(fds, buf, strlen(buf), content_length - strlen(buf+index_body_start));
                     post_body = buf + index_body_start;
                 }
@@ -376,6 +382,7 @@ void* thread_read_request(void *args) {
                 
             free(request->headers);
             free(request);
+            request_partial_length = buffer_partial_to_front(buf, request_buf_len);
         }
         close(connFd);
     }
