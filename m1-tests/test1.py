@@ -327,10 +327,10 @@ def testOK_():
         # (host: str, port: int)
         s.connect((myhost, myport))
 
-        #s.sendall(b'GET / HTTP/1.1\r\nHost: cs.muic.mahidol.ac.th\r\nConnection: close\r\n\r\n')
+        # s.sendall(b'GET / HTTP/1.1\r\nHost: cs.muic.mahidol.ac.th\r\nConnection: close\r\n\r\n')
         s.sendall(b'GET ')
         sleep(1)
-        s.sendall(b'/test.html HTTP/1.1\r')
+        s.sendall(b'/cgi/?name=me HTTP/1.1\r')
         sleep(0.5)
         s.sendall(b'\n')
         s.sendall(b'Host: cs.muic.mahidol.ac.th\r\nConnection: close\r\n')

@@ -20,6 +20,7 @@ extern "C" {
 #include <filesystem>
 #include <pthread.h>
 #include "simple_work_queue.hpp"
+#include "cgi_helper.hpp"
 
 namespace fs = std::filesystem;
 
@@ -27,12 +28,13 @@ namespace fs = std::filesystem;
 #define MAX_HEADER_BUF 8192
 #define MAXBUF 4096
 #define READ_REQUEST_BUF 256
-
+#define SERVER_NAME "ICWS"
 using namespace std;
 
 typedef struct sockaddr SA;
 
 // Default parameter initialization
+std::string cgiHandler;
 std::string port = "8091";
 fs::path rootDir("./");
 int timeout = 5;
@@ -50,10 +52,10 @@ static const char *DAY_NAMES[] =
 static const char *MONTH_NAMES[] =
   { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+const int RFC1123_TIME_LEN = 29;
 
 // https://stackoverflow.com/questions/2726975/how-can-i-generate-an-rfc1123-date-string-from-c-code-win32
 char * parse_rfc_datetime(time_t * t) {
-    const int RFC1123_TIME_LEN = 29;
     char * buf = (char *) malloc(RFC1123_TIME_LEN+1);
     struct tm tm;
 
@@ -78,6 +80,7 @@ void get_cli_argument(int argc, char **argv) {
         {"root", required_argument, NULL, 'r'},
         {"numThreads", required_argument, NULL, 'n'},
         {"timeout", required_argument, NULL, 't'},
+        {"cgiHandler", required_argument, NULL, 'c'},
         {NULL, 0, NULL, 0}
     };
     while ((ch = getopt_long(argc, argv, "p:r:n:t", long_options, NULL)) != -1) {
@@ -98,6 +101,11 @@ void get_cli_argument(int argc, char **argv) {
             case 't':
                 printf("timeout: %s\n", optarg);
                 timeout = atoi(optarg);
+                break;
+            case 'c':
+                printf("cgi: %s\n", optarg);
+                cgiHandler = optarg;
+                std::cout << cgiHandler << std::endl;
                 break;
         }
     }
@@ -134,6 +142,9 @@ void response_template(char* buf, int status) {
         case 404:
             strcpy(status_message, "Not Found");
             break;
+        case 500:
+            strcpy(status_message, "Internal Server Error");
+            break;
         case 501:
             strcpy(status_message, "Not Implemented");
             break;
@@ -143,12 +154,13 @@ void response_template(char* buf, int status) {
     char* currDate = get_current_time();
     sprintf(buf,
             "HTTP/1.1 %d %s\r\n"
-            "Server: ICWS\r\n"
+            "Server: %s\r\n"
             "Connection: keep-alive\r\n"
             "Keep-Alive: timeout=%d, max=0\r\n"
             "Date: %s\r\n",
             status,
             status_message,
+            SERVER_NAME,
             timeout,
             currDate);
     free(currDate);
@@ -209,44 +221,48 @@ void get_file(char* filename, int connFd, int writeBody) {
     fs::path filePath(filename);
     std::string fullDir = (rootDir / filePath).string();
     int inputFd = open(fullDir.c_str(), O_RDONLY);
-    if (inputFd < 0 || (mime_type = get_MIME(filename)).empty())
-    {
+    if (inputFd < 0 || (mime_type = get_MIME(filename)).empty()) {
         response_404(connFd);
     }
-    else
-    {
+    else {
         response_file(inputFd, connFd, writeBody, mime_type);
     }
     if(inputFd) close(inputFd);
 }
+/* Finding the true request headers length, excluding any extra partial request or body */
+int get_request_diff_crlf_length(char * buf) {
+    char *searched = strstr(buf, "\r\n\r\n");
+    if(searched == NULL) {
+        return -1;
+    }
+    return strlen(buf) - strlen(searched+4);
+}
 
-ssize_t get_request_buffer(pollfd fds[], char* buf) {
-    int numRead, rc, isCLRF, clrfPointer;
+ssize_t get_request_buffer(pollfd fds[], char* buf, int offset, int remain_content_length) {
+    printf("Getting buffer\n");
+    fflush(stdout);
+    int numRead, rc, isCLRF, requestDiffLength;
     int connFd = fds[0].fd;
-    int totalRead = 0;
-    char eof_limiter[] = {'\r', '\n'};
-    char *bufp = buf;
+    int totalRead = offset;
+    int maxLength = MAX_HEADER_BUF;
+    if(remain_content_length > 0) {
+        maxLength = remain_content_length;
+    }
+    char *bufp = buf + offset;
 
-    while(totalRead <= MAX_HEADER_BUF) {
+    while(totalRead <= maxLength) {
         rc = poll(fds, 1, timeout * 1000);
         if (rc <= 0) break;
-        if ((numRead = read(connFd, bufp, READ_REQUEST_BUF)) > 0)
-        {
+        if ((numRead = read(connFd, bufp, READ_REQUEST_BUF)) > 0) {
             totalRead += numRead;
-            if(totalRead > MAX_HEADER_BUF) return -1;
+            if(totalRead > maxLength) return -1;
             bufp += numRead;
-            if (strlen(buf) >= 4)
-            {
-                // When \r\n\r\n is send, terminate the sock stream
-                // Works only for GET/HEAD request method
-                isCLRF = 1;
-                clrfPointer = 0;
-                while(isCLRF && (clrfPointer < 4)) {
-                    if (eof_limiter[clrfPointer % 2] != *(bufp - 4 + clrfPointer))
-                        isCLRF = 0;
-                    clrfPointer++;
+            if (strlen(buf) >= 4) {
+                requestDiffLength = get_request_diff_crlf_length(buf);
+                if (requestDiffLength >= 0) {
+                    totalRead = requestDiffLength;
+                    break;
                 }
-                if (isCLRF) break;
             }
         }
         else {
@@ -257,9 +273,34 @@ ssize_t get_request_buffer(pollfd fds[], char* buf) {
     return totalRead;
 }
 
+int get_content_length(Request * request) {
+    int content_length = -1;
+    for (int headerIndex = 0; headerIndex < request->header_count; headerIndex++){
+        if(!strcmp(request->headers[headerIndex].header_name, "Content-Length")) {
+            content_length = atoi(request->headers[headerIndex].header_value);
+        }
+    }
+    return content_length;
+}
+
+/* Check if uri string is for cgi path */
+int uri_is_cgi(char * uri) { 
+    char cgiString[] = "/cgi/";
+    int n = strlen(cgiString);
+    if (strlen(uri) < n)
+        return 0;
+
+    for (int i = 0; i < n; i++) {
+        if(uri[i] != cgiString[i]) return 0;
+    }
+    printf("URL IS CGI!!\n");
+    fflush(stdout);
+    return 1;
+}
+
 void* thread_read_request(void *args) {
     for (;;) {
-        int connFd, rc;
+        int connFd, rc, is_persistent_request = 1;
         // Wait for pthread_cond signal
         pthread_mutex_lock(&shared.work_q.jobs_mutex);
         while (shared.work_q.is_empty()) {
@@ -276,46 +317,65 @@ void* thread_read_request(void *args) {
 
         // TODO: Add support for HTTP Pipeline
 
-        while(true) {
-            rc = poll(fds, 1, timeout * 1000);
-            // printf("rc: %d\n", rc);
-            // fflush(stdout);
-            if (rc <= 0) {
-                break;
-            }
+        while((rc=poll(fds, 1, timeout * 1000)) > 0 && is_persistent_request) {
             char buf[MAX_HEADER_BUF + 555];
-            ssize_t request_buf_len = get_request_buffer(fds, buf);
+            ssize_t request_buf_len = get_request_buffer(fds, buf, 0, -1);
             Request *request = NULL;
-            if (request_buf_len > 0)
-            {
+
+            if (request_buf_len > 0){
                 pthread_mutex_lock(&parse_mutex);
                 request = parse(buf, request_buf_len, connFd);
-                // printf("parsed\n..");
-                // fflush(stdout);
                 pthread_mutex_unlock(&parse_mutex);
             }
-            // printf("%ld\n", request_buf_len);
-            // fflush(stdout);
-            if (request != NULL && request_buf_len > 0) {
-                char* http_method = request->http_method;
-                char* http_uri = request->http_uri;
-                // Remove leading slash for filesystem path join to work properly
-                while(strlen(http_uri) && http_uri[0] == '/')
-                    http_uri++;
-                
-                if(!strcmp(http_method, "GET")) 
-                    get_file(http_uri, connFd, 1);
-                else if(!strcmp(http_method, "HEAD")) 
-                    get_file(http_uri, connFd, 0);
-                else 
-                    response_error_template(connFd, 501);
-                    
-                free(request->headers);
-                free(request);
-            }
-            else {
+            if(request == NULL || request_buf_len <= 0) {
                 response_error_template(connFd, 400);
+                break;
             }
+
+            char *http_method = request->http_method;
+            char *http_uri = request->http_uri;
+            
+            /* Handling CGI Request */
+            if(uri_is_cgi(http_uri)) {
+                is_persistent_request = 0;
+                char *post_body = NULL;
+                if (!strcmp(http_method, "POST")){
+                    // Continue fetching unfishied request.
+                    int content_length = get_content_length(request);
+                    if (content_length < 0 || request_buf_len + content_length > MAX_HEADER_BUF){
+                        response_error_template(connFd, 400);
+                        break;
+                    }
+                    int index_body_start = request_buf_len + 2;
+                    get_request_buffer(fds, buf, strlen(buf), content_length - strlen(buf+index_body_start));
+                    post_body = buf + index_body_start;
+                }
+                struct environ_struct environ_vars = {
+                    request,
+                    port,
+                    std::string(SERVER_NAME),
+                    cgiHandler,
+                    timeout
+                };
+                if(parse_cgi(environ_vars, post_body, connFd) < 0) {
+                    response_error_template(connFd, 500);
+                }
+                break;
+            }
+            /* Handling normal request */
+            // Remove leading slash for filesystem path join to work properly
+            while(strlen(http_uri) && http_uri[0] == '/')
+                http_uri++;
+
+            if(!strcmp(http_method, "GET")) 
+                get_file(http_uri, connFd, 1);
+            else if(!strcmp(http_method, "HEAD")) 
+                get_file(http_uri, connFd, 0);
+            else 
+                response_error_template(connFd, 501);
+                
+            free(request->headers);
+            free(request);
         }
         close(connFd);
     }

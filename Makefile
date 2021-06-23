@@ -1,10 +1,12 @@
 SRC_DIR := src
 OBJ_DIR := obj
 # all src files
-SRC := $($(wildcard $(SRC_DIR)/*.c), $(SRC_DIR)/icws.cpp) 
+SRC := $($(wildcard $(SRC_DIR)/*.c), $(SRC_DIR)/*.cpp) 
 # all objects
-OBJ := $(OBJ_DIR)/y.tab.o $(OBJ_DIR)/lex.yy.o $(OBJ_DIR)/parse.o ${OBJ_DIR}/pcsa_net.o ${OBJ_DIR}/icws.o 
+OBJ := $(OBJ_DIR)/y.tab.o $(OBJ_DIR)/lex.yy.o $(OBJ_DIR)/parse.o ${OBJ_DIR}/pcsa_net.o ${OBJ_DIR}/icws.o ${OBJ_DIR}/cgi_helper.o 
 # all binaries
+CXXOBJ :=  ${OBJ_DIR}/icws.o  ${OBJ_DIR}/cgi_helper.o 
+# CPP binaryes
 BIN := icws
 # C compiler
 CC  := gcc 
@@ -32,6 +34,10 @@ $(SRC_DIR)/y.tab.c: $(SRC_DIR)/parser.y
 
 $(OBJ_DIR)/icws.o: $(SRC_DIR)/icws.cpp $(OBJ_DIR)
 	g++ -g -Wall $(CXXFLAGS) -c $< -o $@
+
+$(OBJ_DIR)/cgi_helper.o: $(SRC_DIR)/cgi_helper.cpp $(OBJ_DIR)
+	g++ -g -Wall $(CXXFLAGS) -c $< -o $@
+
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c $(OBJ_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
