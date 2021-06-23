@@ -133,7 +133,7 @@ std::string get_MIME(char * filename) {
     return tmp;
 }
 
-void response_template(char* buf, int status) {
+void response_template(char* buf, int status, int is_connection_close) {
     char status_message[MAXBUF];
     switch (status) {
         case 200:
@@ -164,31 +164,36 @@ void response_template(char* buf, int status) {
     sprintf(buf,
             "HTTP/1.1 %d %s\r\n"
             "Server: %s\r\n"
-            "Connection: keep-alive\r\n"
-            "Keep-Alive: timeout=%d, max=0\r\n"
             "Date: %s\r\n",
             status,
             status_message,
             SERVER_NAME,
-            timeout,
             currDate);
+    if (!is_connection_close) {
+        sprintf(buf + strlen(buf),
+            "Connection: keep-alive\r\n"
+            "Keep-Alive: timeout=%d, max=0\r\n",
+            timeout);
+    } else {
+        sprintf(buf + strlen(buf), "Connection: close\r\n");
+    }
     free(currDate);
 }
 
-void response_error_template(int connFd, int status) {
+void response_error_template(int connFd, int status, int is_connection_close) {
     char responseBuf[MAXBUF];
     char clrfBuf[] = "\r\n";
-    response_template(responseBuf, status);
+    response_template(responseBuf, status, is_connection_close);
     write_all(connFd, responseBuf, strlen(responseBuf));
     write_all(connFd, clrfBuf, 2);
 }
 
-void response_404(int connFd) {
+void response_404(int connFd, int is_connection_close) {
     // printf("Returning 404...\n");
     // fflush(stdout);
     char buf[MAXBUF];
     std::string msg = "<h1>404 Content not found</h1> ";
-    response_template(buf, 404);
+    response_template(buf, 404, is_connection_close);
     sprintf(buf + strlen(buf),   
             "Content-Length: %lu\r\n"
             "Content-Type: text/html\r\n\r\n", strlen(msg.c_str()));
@@ -196,13 +201,13 @@ void response_404(int connFd) {
     write_all(connFd, &msg[0], strlen(msg.c_str()));
 }
 
-void response_file(int inputFd, int connFd, int writeBody, std::string mime_type) {
+void response_file(int inputFd, int connFd, int writeBody, std::string mime_type, int is_connection_close) {
     char buf[MAXBUF];
     struct stat statBuffer;
     fstat(inputFd, &statBuffer);
     int fileSize = statBuffer.st_size;
     char * modified_time = parse_rfc_datetime(&statBuffer.st_mtime);
-    response_template(buf, 200);
+    response_template(buf, 200, is_connection_close);
     sprintf(buf + strlen(buf), 
             "Content-Length: %d\r\n"
             "Content-Type: %s\r\n"
@@ -225,16 +230,16 @@ void response_file(int inputFd, int connFd, int writeBody, std::string mime_type
     free(modified_time);
 }
 
-void get_file(char* filename, int connFd, int writeBody) {
+void get_file(char* filename, int connFd, int writeBody, int is_connection_close) {
     std::string mime_type;
     fs::path filePath(filename);
     std::string fullDir = (rootDir / filePath).string();
     int inputFd = open(fullDir.c_str(), O_RDONLY);
     if (inputFd < 0 || (mime_type = get_MIME(filename)).empty()) {
-        response_404(connFd);
+        response_404(connFd, is_connection_close);
     }
     else {
-        response_file(inputFd, connFd, writeBody, mime_type);
+        response_file(inputFd, connFd, writeBody, mime_type, is_connection_close);
     }
     if(inputFd) close(inputFd);
 }
@@ -314,8 +319,6 @@ int uri_is_cgi(char * uri) {
     for (int i = 0; i < (int) n; i++) {
         if(uri[i] != cgiString[i]) return 0;
     }
-    printf("URL IS CGI!!\n");
-    fflush(stdout);
     return 1;
 }
 
@@ -329,10 +332,30 @@ int buffer_partial_to_front(char *buf, int request_buf_len) {
     return partial_length;
 }
 
+int is_connection_closed(Request *request) { 
+    int headerIndex;
+    for (headerIndex = 0; headerIndex < request->header_count; headerIndex++) {
+        if(!strcmp(request->headers[headerIndex].header_name, "Connection")) {
+            if(!strcmp(request->headers[headerIndex].header_value, "close")) {
+                return 1;
+            }
+            return 0;
+        }
+    }
+    return -1;
+}
+
+int support_cgi_protocol(char * method) {
+    if(!strcmp(method, "GET")) return 1;
+    else if(!strcmp(method, "POST")) return 1;
+    else if(!strcmp(method, "HEAD")) return 1;
+    else return 0;
+}
+
 void* thread_read_request(void *args) {
     for (;;) {
         char buf[MAX_HEADER_BUF + 555];
-        int connFd, rc, request_partial_length = 0;
+        int connFd, rc, is_connection_close = 0, request_partial_length = 0;
         // Wait for pthread_cond signal
         pthread_mutex_lock(&shared.work_q.jobs_mutex);
         while (shared.work_q.is_empty()) {
@@ -346,8 +369,8 @@ void* thread_read_request(void *args) {
         memset(fds, 0, sizeof(fds));
         fds[0].fd = connFd;
         fds[0].events = POLLIN;
-
-        while(request_partial_length > 0 || (rc=poll(fds, 1, timeout * 1000)) > 0) {
+        
+        while(!is_connection_close && (request_partial_length > 0 || (rc=poll(fds, 1, timeout * 1000)) > 0)) {
             int request_buf_len = get_request_buffer(fds, buf, request_partial_length, -1);
             Request *request = NULL;
             if (request_buf_len > 0){
@@ -357,31 +380,33 @@ void* thread_read_request(void *args) {
             }
             else if(request_buf_len == -2) {
                 // Timeout, incomplete request read
-                response_error_template(connFd, 408);
+                response_error_template(connFd, 408, 1);
                 break;
             }
             
             if(request == NULL || request_buf_len <= 0) {
-                response_error_template(connFd, 400);
+                response_error_template(connFd, 400, 1);
                 break;
             }
 
             char *http_method = request->http_method;
             char *http_uri = request->http_uri;
-            
-            if(strcmp(request->http_version, "HTTP/1.1") != 0) {
-                response_error_template(connFd, 505);
+            if (strcmp(request->http_version, "HTTP/1.1") != 0){
+                response_error_template(connFd, 505, 1);
                 break;
             }
-
             /* Handling CGI Request */
             if(uri_is_cgi(http_uri)) {
+                if(!support_cgi_protocol(http_method)) {
+                    response_error_template(connFd, 501, 1);
+                    break;
+                }
                 char *post_body = NULL;
                 if (!strcmp(http_method, "POST")){
                     // Continue fetching unfishied request.
                     int content_length = get_content_length(request);
                     if (content_length < 0 || request_buf_len + content_length > MAX_HEADER_BUF){
-                        response_error_template(connFd, 411);
+                        response_error_template(connFd, 411, 1);
                         break;
                     }
                     get_request_buffer(fds, buf, strlen(buf), content_length - strlen(buf+request_buf_len));
@@ -395,25 +420,28 @@ void* thread_read_request(void *args) {
                     timeout
                 };
                 if(parse_cgi(environ_vars, post_body, connFd) < 0) {
-                    response_error_template(connFd, 500);
+                    response_error_template(connFd, 500, 1);
                 }
                 break;
             }
+            is_connection_close = is_connection_closed(request);
             /* Handling normal request */
+            
             // Remove leading slash for filesystem path join to work properly
             while(strlen(http_uri) && http_uri[0] == '/')
                 http_uri++;
 
             if(!strcmp(http_method, "GET")) 
-                get_file(http_uri, connFd, 1);
+                get_file(http_uri, connFd, 1, is_connection_close);
             else if(!strcmp(http_method, "HEAD")) 
-                get_file(http_uri, connFd, 0);
+                get_file(http_uri, connFd, 0, is_connection_close);
             else 
-                response_error_template(connFd, 501);
+                response_error_template(connFd, 501, is_connection_close);
                 
             free(request->headers);
             free(request);
-            request_partial_length = buffer_partial_to_front(buf, request_buf_len);
+
+            if(!is_connection_close) request_partial_length = buffer_partial_to_front(buf, request_buf_len);
         }
         close(connFd);
     }
@@ -453,7 +481,3 @@ int main(int argc, char **argv){
     initialize_thread_pools();
     start_server();
 }
-
-
-
-
