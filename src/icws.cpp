@@ -284,8 +284,11 @@ int get_request_buffer(pollfd fds[], char* buf, int offset, int remain_content_l
             if(totalRead > maxLength) return -1;
             bufp += numRead;
             if(remain_content_length < 0 && totalRead >= 4){
-                requestDiffLength = get_request_diff_crlf_length(bufp-numRead-3, strlen(buf));
-                if (requestDiffLength > 0) {
+                int positionDiff = totalRead - numRead - 3;
+                if(positionDiff < 0) positionDiff = 0;
+                requestDiffLength = get_request_diff_crlf_length(buf + positionDiff, strlen(buf));
+                if (requestDiffLength > 0)
+                {
                     totalRead = requestDiffLength;
                     break;
                 }
@@ -332,6 +335,18 @@ int buffer_partial_to_front(char *buf, int request_buf_len) {
     return partial_length;
 }
 
+int is_same_http_version(char *http_version) {
+    return !strcmp(http_version, "HTTP/1.1");
+}
+
+int is_old_http_version(char *http_version) {
+    return !strcmp(http_version, "HTTP/1.0");
+}
+
+int is_compatible_http_version(char *http_version) {
+    return is_same_http_version(http_version) || is_old_http_version(http_version);
+}
+
 int is_connection_closed(Request *request) { 
     int headerIndex;
     for (headerIndex = 0; headerIndex < request->header_count; headerIndex++) {
@@ -356,6 +371,7 @@ void* thread_read_request(void *args) {
     for (;;) {
         char buf[MAX_HEADER_BUF + 555];
         int connFd, rc, is_connection_close = 0, request_partial_length = 0;
+        Request *request = NULL;
         // Wait for pthread_cond signal
         pthread_mutex_lock(&shared.work_q.jobs_mutex);
         while (shared.work_q.is_empty()) {
@@ -371,9 +387,11 @@ void* thread_read_request(void *args) {
         fds[0].events = POLLIN;
         
         while(!is_connection_close && (request_partial_length > 0 || (rc=poll(fds, 1, timeout * 1000)) > 0)) {
+            printf("Getting request buffer...\n");
             int request_buf_len = get_request_buffer(fds, buf, request_partial_length, -1);
-            Request *request = NULL;
-            if (request_buf_len > 0){
+            printf("Buffered len: %d\n", request_buf_len);
+            if (request_buf_len > 0)
+            {
                 pthread_mutex_lock(&parse_mutex);
                 request = parse(buf, request_buf_len, connFd);
                 pthread_mutex_unlock(&parse_mutex);
@@ -391,7 +409,7 @@ void* thread_read_request(void *args) {
 
             char *http_method = request->http_method;
             char *http_uri = request->http_uri;
-            if (strcmp(request->http_version, "HTTP/1.1") != 0){
+            if (!is_compatible_http_version(request->http_version)){
                 response_error_template(connFd, 505, 1);
                 break;
             }
@@ -409,7 +427,10 @@ void* thread_read_request(void *args) {
                         response_error_template(connFd, 411, 1);
                         break;
                     }
-                    get_request_buffer(fds, buf, strlen(buf), content_length - strlen(buf+request_buf_len));
+                    if(get_request_buffer(fds, buf, strlen(buf), content_length - strlen(buf+request_buf_len)) < 0) {
+                        response_error_template(connFd, 400, 1);
+                        break;
+                    }
                     post_body = buf + request_buf_len;
                 }
                 struct environ_struct environ_vars = {
@@ -440,8 +461,13 @@ void* thread_read_request(void *args) {
                 
             free(request->headers);
             free(request);
-
-            if(!is_connection_close) request_partial_length = buffer_partial_to_front(buf, request_buf_len);
+            request = NULL;
+            if (!is_connection_close) request_partial_length = buffer_partial_to_front(buf, request_buf_len);
+        }
+        // Clean left over request
+        if(request != NULL) {
+            free(request->headers);
+            free(request);
         }
         close(connFd);
     }

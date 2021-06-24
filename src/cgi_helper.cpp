@@ -71,8 +71,11 @@ int add_environ_vars(environ_struct environ_vars, int connFd) {
     } else {
         set_env("QUERY_STRING", "", &status);
     }
-    tmpUri[strlen(tmpUri) - 1] = '\0';
-    set_env("PATH_INFO", tmpUri, &status);
+    // PATH_INFO for anything after /cgi/..., excluding queries
+    // Ex. GET /cgi/baz?query=foo. PATH_INFO = /baz
+    int tmpUriLength = strlen(tmpUri);
+    if (tmpUri[tmpUriLength - 1] == '/' && tmpUriLength > 5) tmpUri[tmpUriLength - 1] = '\0';
+    set_env("PATH_INFO", tmpUri + 4, &status);
 
     if(!status) {
         return -1;
