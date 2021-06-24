@@ -10,6 +10,7 @@ extern "C" {
     #include <unistd.h>
     #include <getopt.h>
     #include <time.h>
+    #include <signal.h>
     #include "pcsa_net.h"
     #include "parse.h"
 }
@@ -260,7 +261,6 @@ int get_request_diff_crlf_length(char * bufp, int full_buf_length) {
         Positive int refers buf true size 
 */
 int get_request_buffer(pollfd fds[], char* buf, int offset, int remain_content_length) {
-    fflush(stdout);
     // Quick check if buf have partial request, and already contain a complete request.
     if(offset > 0) {
         int crlf_check_length = get_request_diff_crlf_length(buf, strlen(buf));
@@ -505,5 +505,6 @@ int main(int argc, char **argv){
     // https://stackoverflow.com/questions/7489093/getopt-long-proper-way-to-use-it
     get_cli_argument(argc, argv);
     initialize_thread_pools();
+    signal(SIGPIPE, SIG_IGN); // Temporary solution to ignore broken write when socket is already closed
     start_server();
 }
