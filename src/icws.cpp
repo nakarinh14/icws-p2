@@ -220,12 +220,7 @@ void response_file(int inputFd, int connFd, int writeBody, std::string mime_type
         ssize_t numRead;
         char fileBuf[MAXBUF];
         while ((numRead = read(inputFd, fileBuf, MAXBUF)) > 0) {
-            char *tmpBuf = fileBuf;
-            while(numRead > 0) {
-                ssize_t numWritten = write(connFd, tmpBuf, numRead);
-                numRead -= numWritten;
-                tmpBuf += numWritten;
-            }
+            write_all(connFd, fileBuf, numRead);
         }
     }
     free(modified_time);
@@ -286,7 +281,7 @@ int get_request_buffer(pollfd fds[], char* buf, int offset, int remain_content_l
             if(remain_content_length < 0 && totalRead >= 4){
                 int positionDiff = totalRead - numRead - 3;
                 if(positionDiff < 0) positionDiff = 0;
-                requestDiffLength = get_request_diff_crlf_length(buf + positionDiff, strlen(buf));
+                requestDiffLength = get_request_diff_crlf_length(buf + positionDiff, totalRead);
                 if (requestDiffLength > 0)
                 {
                     totalRead = requestDiffLength;
@@ -325,12 +320,14 @@ int uri_is_cgi(char * uri) {
     return 1;
 }
 
-int buffer_partial_to_front(char *buf, int request_buf_len) {
+int buffer_partial_to_front(char *buf, int request_buf_len, int full_buf_size) {
     /* Shift partial request content to front for persistent pipelining */
-    int partial_length = strlen(buf) - request_buf_len;
+    int partial_length = full_buf_size - request_buf_len;
     if(partial_length >= 0){
-        memmove(buf, buf + request_buf_len, partial_length);
-        memset(buf + partial_length, '\0', strlen(buf) - partial_length); // Set leftover to null terminating character
+        if(partial_length > 0) {
+            memmove(buf, buf + request_buf_len, partial_length);
+        }
+        memset(buf + partial_length, '\0', full_buf_size - partial_length); // Set leftover to null terminating character
     }
     return partial_length;
 }
@@ -413,6 +410,7 @@ void* thread_read_request(void *args) {
                 response_error_template(connFd, 505, 1);
                 break;
             }
+            int full_buf_size = strlen(buf);
             /* Handling CGI Request */
             if(uri_is_cgi(http_uri)) {
                 if(!support_cgi_protocol(http_method)) {
@@ -427,7 +425,7 @@ void* thread_read_request(void *args) {
                         response_error_template(connFd, 411, 1);
                         break;
                     }
-                    if(get_request_buffer(fds, buf, strlen(buf), content_length - strlen(buf+request_buf_len)) < 0) {
+                    if(get_request_buffer(fds, buf, full_buf_size, content_length - strlen(buf+request_buf_len)) < 0) {
                         response_error_template(connFd, 400, 1);
                         break;
                     }
@@ -462,7 +460,9 @@ void* thread_read_request(void *args) {
             free(request->headers);
             free(request);
             request = NULL;
-            if (!is_connection_close) request_partial_length = buffer_partial_to_front(buf, request_buf_len);
+            if (!is_connection_close) {
+                request_partial_length = buffer_partial_to_front(buf, request_buf_len, full_buf_size);
+            }
         }
         // Clean left over request
         if(request != NULL) {
