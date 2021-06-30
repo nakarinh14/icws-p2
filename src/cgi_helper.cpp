@@ -49,8 +49,6 @@ int add_environ_vars(environ_struct environ_vars, int connFd) {
     int status = 1;
     set_env("REQUEST_METHOD", request->http_method, &status);
     set_env("REQUEST_URI", request->http_uri, &status);
-    set_env("SCRIPT_NAME", environ_vars.cgi_handler.c_str(), &status);
-    // set_env("QUERY_STRING", request->http_uri, &status);
     set_env("SERVER_PROTOCOL", "HTTP/1.1", &status);
     set_env("SERVER_PORT", environ_vars.port.c_str(), &status);
     set_env("SERVER_SOFTWARE", environ_vars.server_name.c_str(), &status);
@@ -72,10 +70,11 @@ int add_environ_vars(environ_struct environ_vars, int connFd) {
         set_env("QUERY_STRING", "", &status);
     }
     // PATH_INFO for anything after /cgi/..., excluding queries
-    // Ex. GET /cgi/baz?query=foo. PATH_INFO = /baz
+    // Ex. GET /cgi/baz?query=foo. PATH_INFO = /cgi/baz
     int tmpUriLength = strlen(tmpUri);
     if (tmpUri[tmpUriLength - 1] == '/' && tmpUriLength > 5) tmpUri[tmpUriLength - 1] = '\0';
-    set_env("PATH_INFO", tmpUri + 4, &status);
+    set_env("PATH_INFO", tmpUri, &status);
+    set_env("SCRIPT_NAME", tmpUri, &status);
 
     if(!status) {
         return -1;
