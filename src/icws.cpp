@@ -11,6 +11,7 @@ extern "C" {
     #include <getopt.h>
     #include <time.h>
     #include <signal.h>
+    #include <ctype.h>
     #include "pcsa_net.h"
     #include "parse.h"
 }
@@ -315,7 +316,7 @@ int get_request_buffer(pollfd fds[], char* buf, int offset, int remain_content_l
 int get_content_length(Request * request) {
     int content_length = -1;
     for (int headerIndex = 0; headerIndex < request->header_count; headerIndex++){
-        if(!strcmp(request->headers[headerIndex].header_name, "Content-Length")) {
+        if(!strcmp(request->headers[headerIndex].header_name, "CONTENT-LENGTH")) {
             content_length = atoi(request->headers[headerIndex].header_value);
         }
     }
@@ -362,7 +363,7 @@ int is_compatible_http_version(char *http_version) {
 int is_connection_closed(Request *request) { 
     int headerIndex;
     for (headerIndex = 0; headerIndex < request->header_count; headerIndex++) {
-        if(!strcmp(request->headers[headerIndex].header_name, "Connection")) {
+        if(!strcmp(request->headers[headerIndex].header_name, "CONNECTION")) {
             if(!strcmp(request->headers[headerIndex].header_value, "close")) {
                 return 1;
             }
@@ -377,6 +378,15 @@ int support_cgi_protocol(char * method) {
     else if(!strcmp(method, "POST")) return 1;
     else if(!strcmp(method, "HEAD")) return 1;
     else return 0;
+}
+/* According to RFC, header name is case insensitive, so parse all headername to uppercase for easier handling. */
+void parse_header_name_upper(Request * request) {
+    for (int header_idx = 0; header_idx < request->header_count; header_idx++) {
+        char *header_name = request->headers[header_idx].header_name;
+        for(int i = 0; header_name[i]; i++){
+  		    header_name[i] = toupper(header_name[i]);
+	    }
+    }
 }
 
 void* thread_read_request(void *args) {
@@ -418,13 +428,13 @@ void* thread_read_request(void *args) {
                 response_error_template(connFd, 400, 1);
                 break;
             }
-
             char *http_method = request->http_method;
             char *http_uri = request->http_uri;
             if (!is_compatible_http_version(request->http_version)){
                 response_error_template(connFd, 505, 1);
                 break;
             }
+            parse_header_name_upper(request);
             int full_buf_size = strlen(buf);
             /* Handling CGI Request */
             if(uri_is_cgi(http_uri)) {

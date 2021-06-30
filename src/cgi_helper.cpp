@@ -25,17 +25,17 @@ void fail_exit(char *msg) {
 }
 
 std::unordered_map<std::string, std::string> header_env_name = {
-    {"Accept", "HTTP_ACCEPT"},
-    {"Host", "HTTP_HOST"},
-    {"Cookie", "HTTP_COOKIE"},
-    {"Referer", "HTTP_REFERER"},
-    {"Accept-Encoding", "HTTP_ACCEPT_ENCODING"},
-    {"Accept-Language", "HTTP_ACCEPT_LANGUAGE"},
-    {"Accept-Charset", "HTTP_ACCEPT_CHARSET"},
-    {"User-Agent", "HTTP_USER_AGENT"},
-    {"Connection", "HTTP_CONNECTION"},
-    {"Content-Length", "CONTENT_LENGTH"},
-    {"Content-Type", "CONTENT_TYPE"}
+    {"ACCEPT", "HTTP_ACCEPT"},
+    {"HOST", "HTTP_HOST"},
+    {"COOKIE", "HTTP_COOKIE"},
+    {"REFERER", "HTTP_REFERER"},
+    {"ACCEPT-ENCODING", "HTTP_ACCEPT_ENCODING"},
+    {"ACCEPT-LANGUAGE", "HTTP_ACCEPT_LANGUAGE"},
+    {"ACCEPT-CHARSET", "HTTP_ACCEPT_CHARSET"},
+    {"USER-AGENT", "HTTP_USER_AGENT"},
+    {"CONNECTION", "HTTP_CONNECTION"},
+    {"CONTENT-LENGTH", "CONTENT_LENGTH"},
+    {"CONTENT-TYPE", "CONTENT_TYPE"}
 };
 
 void set_env(const char *key, const char *value, int *status) {
