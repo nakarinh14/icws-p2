@@ -20,11 +20,13 @@ extern "C" {
 #include <thread>
 #include <filesystem>
 #include <pthread.h>
+#include <chrono>
 #include "simple_work_queue.hpp"
 #include "cgi_helper.hpp"
 
 namespace fs = std::filesystem;
-
+using steady_clock = std::chrono::steady_clock;
+using clock_sec = std::chrono::duration<double>;
 
 #define MAX_HEADER_BUF 8192
 #define MAXBUF 4096
@@ -239,6 +241,14 @@ void get_file(char* filename, int connFd, int writeBody, int is_connection_close
     }
     if(inputFd) close(inputFd);
 }
+/* Get meaningful elapsed time by deciding the entire request threshold time. Used std::chrono. https://stackoverflow.com/a/27739925 */
+int is_meaningful_elapsed_time(clock_sec time_difference) {
+    if (time_difference.count() > ((double)timeout) * 3.5) {
+        return 0;
+    }
+    return 1;
+}
+
 /* Finding the true request headers length, excluding any extra partial request or body */
 int get_request_diff_crlf_length(char * bufp, int full_buf_length) {
     if(full_buf_length < 4) return -1;
@@ -249,7 +259,8 @@ int get_request_diff_crlf_length(char * bufp, int full_buf_length) {
     return full_buf_length - strlen(searched+4);
 }
 /*
-    Handle reading request from connFd to store in buffer. Return true length until crlf of first request 
+    Handle reading request from connFd to store in buffer. Return true length until crlf of first request.
+    If remain_content_length >= 0, then its only for grabbing POST body
     Return value: 
         -1 System error
         -2 Timeout error
@@ -257,7 +268,7 @@ int get_request_diff_crlf_length(char * bufp, int full_buf_length) {
 */
 int get_request_buffer(pollfd fds[], char* buf, int offset, int remain_content_length) {
     // Quick check if buf have partial request, and already contain a complete request.
-    if(offset > 0) {
+    if(remain_content_length < 0 && offset > 0) {
         int crlf_check_length = get_request_diff_crlf_length(buf, strlen(buf));
         if (crlf_check_length >= 0) return crlf_check_length;
     }
@@ -267,11 +278,12 @@ int get_request_buffer(pollfd fds[], char* buf, int offset, int remain_content_l
     int totalRead = offset;
     int maxLength = MAX_HEADER_BUF;
     if(remain_content_length >= 0) {
+        totalRead = 0;
         maxLength = remain_content_length;
     }
     char *bufp = buf + offset;
-
-    while(totalRead < maxLength) {
+    steady_clock::time_point started_time = steady_clock::now();
+    while (totalRead < maxLength){
         rc = poll(fds, 1, timeout * 1000);
         if (rc <= 0) return -2;
         else if ((numRead = read(connFd, bufp, READ_REQUEST_BUF)) > 0) {
@@ -282,8 +294,7 @@ int get_request_buffer(pollfd fds[], char* buf, int offset, int remain_content_l
                 int positionDiff = totalRead - numRead - 3;
                 if(positionDiff < 0) positionDiff = 0;
                 requestDiffLength = get_request_diff_crlf_length(buf + positionDiff, totalRead);
-                if (requestDiffLength > 0)
-                {
+                if (requestDiffLength > 0){
                     totalRead = requestDiffLength;
                     break;
                 }
@@ -291,6 +302,10 @@ int get_request_buffer(pollfd fds[], char* buf, int offset, int remain_content_l
         }
         else {
             return -1;
+        }
+        // If elapsed time is not meaningful, return timeout error
+        if(!is_meaningful_elapsed_time(steady_clock::now() - started_time)) {
+            return -2;
         }
     }
     *bufp = '\0';
@@ -425,8 +440,14 @@ void* thread_read_request(void *args) {
                         response_error_template(connFd, 411, 1);
                         break;
                     }
-                    if(get_request_buffer(fds, buf, full_buf_size, content_length - strlen(buf+request_buf_len)) < 0) {
-                        response_error_template(connFd, 400, 1);
+                    int partial_content_length = content_length - strlen(buf + request_buf_len);
+                    int post_body_state = -1;
+                    if(partial_content_length >= 0) {
+                        post_body_state = get_request_buffer(fds, buf, full_buf_size, partial_content_length);
+                    }
+                    if(post_body_state < 0) {
+                        if (post_body_state == -1) response_error_template(connFd, 400, 1);
+                        else if (post_body_state == -2) response_error_template(connFd, 408, 1);
                         break;
                     }
                     post_body = buf + request_buf_len;
